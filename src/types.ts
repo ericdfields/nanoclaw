@@ -51,6 +51,8 @@ export interface NewMessage {
   timestamp: string;
   is_from_me?: boolean;
   is_bot_message?: boolean;
+  /** Absolute path to a processed image file (set by channels that support vision) */
+  imagePath?: string;
 }
 
 export interface ScheduledTask {

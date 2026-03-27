@@ -25,6 +25,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { OneCLI } from '@onecli-sh/sdk';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -42,6 +43,8 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  /** Absolute paths to image files to include as multimodal content */
+  images?: string[];
 }
 
 export interface ContainerOutput {
@@ -238,6 +241,33 @@ async function buildContainerArgs(
     );
   }
 
+  // If a real OAuth token is available, pass it directly and remove
+  // conflicting env vars that OneCLI's applyContainerConfig may have set.
+  // Claude Pro/Max subscriptions use OAuth tokens, not API keys.
+  const envVars = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN']);
+  const oauthToken =
+    process.env.CLAUDE_CODE_OAUTH_TOKEN ||
+    envVars.CLAUDE_CODE_OAUTH_TOKEN;
+  if (oauthToken && oauthToken !== 'placeholder') {
+    args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${oauthToken}`);
+    // Remove ANTHROPIC_API_KEY=placeholder and proxy vars that interfere with OAuth
+    const removeKeys = new Set([
+      'ANTHROPIC_API_KEY',
+      'HTTPS_PROXY',
+      'HTTP_PROXY',
+      'NODE_USE_ENV_PROXY',
+    ]);
+    for (let i = args.length - 1; i >= 0; i--) {
+      if (
+        args[i] === '-e' &&
+        i + 1 < args.length &&
+        removeKeys.has(args[i + 1].split('=')[0])
+      ) {
+        args.splice(i, 2);
+      }
+    }
+  }
+
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
 
@@ -326,7 +356,14 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
-    container.stdin.write(JSON.stringify(input));
+    // Remap host image paths to container paths before passing input
+    const containerInput = { ...input };
+    if (containerInput.images && containerInput.images.length > 0) {
+      containerInput.images = containerInput.images.map((hostPath) =>
+        hostPath.replace(groupDir, '/workspace/group'),
+      );
+    }
+    container.stdin.write(JSON.stringify(containerInput));
     container.stdin.end();
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive

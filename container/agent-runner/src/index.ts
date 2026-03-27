@@ -27,6 +27,8 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  /** Absolute paths to image files for multimodal content */
+  images?: string[];
 }
 
 interface ContainerOutput {
@@ -47,9 +49,13 @@ interface SessionsIndex {
   entries: SessionEntry[];
 }
 
+type ContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+
 interface SDKUserMessage {
   type: 'user';
-  message: { role: 'user'; content: string };
+  message: { role: 'user'; content: string | ContentBlock[] };
   parent_tool_use_id: null;
   session_id: string;
 }
@@ -71,6 +77,16 @@ class MessageStream {
     this.queue.push({
       type: 'user',
       message: { role: 'user', content: text },
+      parent_tool_use_id: null,
+      session_id: '',
+    });
+    this.waiting?.();
+  }
+
+  pushMultimodal(content: ContentBlock[]): void {
+    this.queue.push({
+      type: 'user',
+      message: { role: 'user', content },
       parent_tool_use_id: null,
       session_id: '',
     });
@@ -336,9 +352,30 @@ async function runQuery(
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
   resumeAt?: string,
+  images?: string[],
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
-  stream.push(prompt);
+
+  // Build multimodal content if images are present
+  if (images && images.length > 0) {
+    const blocks: ContentBlock[] = [];
+    for (const imgPath of images) {
+      try {
+        const data = fs.readFileSync(imgPath).toString('base64');
+        blocks.push({
+          type: 'image',
+          source: { type: 'base64', media_type: 'image/jpeg', data },
+        });
+        log(`Loaded image: ${imgPath} (${data.length} base64 chars)`);
+      } catch (err) {
+        log(`Failed to load image ${imgPath}: ${err}`);
+      }
+    }
+    blocks.push({ type: 'text', text: prompt });
+    stream.pushMultimodal(blocks);
+  } else {
+    stream.push(prompt);
+  }
 
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
@@ -507,11 +544,13 @@ async function main(): Promise<void> {
 
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
+  let pendingImages = containerInput.images;
   try {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt, pendingImages);
+      pendingImages = undefined; // Only pass images on the first query
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
